@@ -20,6 +20,7 @@ dependencies = [
     "ucp-sdk",
     "shortuuid",
     "httpx>=0.26.0",
+    "sse-starlette>=2.0.0",
 ]
 
 [dependency-groups]
@@ -38,7 +39,7 @@ packages = ["."]
 
 [tool.uv.sources]
 # The relative path is stored here
-ucp-sdk = { path = "../../../../sdk/python/", editable = true }
+ucp-sdk = { path = "../../../../python-sdk/", editable = true }
 
 [tool.ruff]
 line-length = 80
