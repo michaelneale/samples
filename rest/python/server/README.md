@@ -19,47 +19,109 @@
 This is a reference implementation of a UCP Merchant Server, designed to be
 deployable both inside and outside of Google.
 
-## Project Structure
+**Supported Transports:**
+- REST API (OpenAPI)
+- MCP (Model Context Protocol) for AI agents
 
-*   `server.py`: The entry point for the FastAPI application.
-*   `pyproject.toml`: Project configuration for external dependency management
-    and packaging.
+## Quick Start
 
-## Prerequisites
-
-1.  Install uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`
-2.  Install dependencies: `uv sync`
-
-## Prepare the workspace
-
-First, clone the necessary repositories and set your environment variables. You
-will need both the Samples repository (which contains the Python server) and the
-SDK repository.
-
-NOTE: Temporarily the Samples repository expects the SDK at a known relative
-filesystem location, as such, the target paths in these example are significant.
+The easiest way to run the server:
 
 ```shell
-mkdir sdk
-git clone https://github.com/Universal-Commerce-Protocol/python-sdk.git sdk/python
-pushd sdk/python
-uv sync
-popd
+./start.sh
+```
+
+This will:
+1. Install dependencies via `uv`
+2. Initialize the sample database (flower shop products)
+3. Start the server on port 8182
+
+Once running, you'll have:
+- **REST endpoint:** http://localhost:8182/
+- **MCP endpoint:** http://localhost:8182/ucp/mcp
+- **Discovery:** http://localhost:8182/.well-known/ucp
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8182` | Server port |
+| `DB_DIR` | `/tmp/ucp_test` | Database directory |
+
+Example: `PORT=3000 ./start.sh`
+
+## MCP (Model Context Protocol) Support
+
+The server implements the MCP protocol, allowing AI agents (like Claude, Goose, 
+or other MCP clients) to interact with the checkout system.
+
+### Available MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `create_checkout` | Create a new checkout session with items |
+| `get_checkout` | Get current checkout state |
+| `update_checkout` | Update buyer info, shipping, discounts |
+| `complete_checkout` | Complete order (requires payment token) |
+| `cancel_checkout` | Cancel the checkout session |
+
+### Connecting an MCP Client
+
+Add the server to your MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "ucp-shopping": {
+      "url": "http://localhost:8182/ucp/mcp"
+    }
+  }
+}
+```
+
+### Testing MCP
+
+Run the MCP test suite:
+
+```shell
+uv run python test_mcp.py
+```
+
+### Payment Flow for Agents
+
+The checkout flow is designed with security in mind:
+
+1. **Agent prepares checkout:** Uses `create_checkout` and `update_checkout` to
+   add items, buyer info, and shipping details
+2. **User completes payment:** When status is `ready_for_complete`, the agent
+   presents the `continue_url` to the user
+3. **User pays securely:** User opens the URL in a browser to complete payment
+   via the merchant's secure payment UI (Google Pay, etc.)
+
+> **Note:** The `complete_checkout` tool requires pre-authorized payment tokens
+> (e.g., from AP2 mandates). For normal flows, agents should hand off to the
+> `continue_url` for payment.
+
+## Manual Setup
+
+If you prefer manual setup instead of `./start.sh`:
+
+### Prerequisites
+
+1.  Install uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+
+### Clone Repositories
+
+```shell
+# Clone SDK and samples side by side
+git clone https://github.com/Universal-Commerce-Protocol/python-sdk.git
 git clone https://github.com/Universal-Commerce-Protocol/samples.git
+
 cd samples/rest/python/server
 uv sync
 ```
 
-## Initialize the sample database
-
-The test server is a store front for a flower shop; we have some test data to
-exemplify ordering various items. The data is a simple SQLite database created
-in a separate step to allow easy experimentation and inspection after each
-request.
-
-Run the following commands to create a local database populated with example
-test data. This script maps raw product information into the UCP schema so the
-sample server can respond to queries.
+### Initialize Database
 
 ```shell
 mkdir /tmp/ucp_test
@@ -69,23 +131,14 @@ uv run import_csv.py \
     --data_dir=../test_data/flower_shop
 ```
 
-## Run the Server
-
-Start the server on port 8182, pointing to your initialized data.
-
-Start it in the background so we can use the terminal for other commands or
-start the server and the client in separate terminals.
+### Run Server
 
 ```shell
 uv run server.py \
    --products_db_path=/tmp/ucp_test/products.db \
    --transactions_db_path=/tmp/ucp_test/transactions.db \
-   --port=8182 &
-SERVER_PID=$!
+   --port=8182
 ```
-
-Note: Keep the server running for the duration of running the client and the
-following experiments.
 
 ## Run a Simple Client
 

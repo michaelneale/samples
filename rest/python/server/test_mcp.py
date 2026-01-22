@@ -57,6 +57,31 @@ def test_discovery():
   print("✓ Discovery test passed")
 
 
+def test_list_products():
+  """Test list_products MCP method."""
+  print("\n=== Testing list_products ===")
+  result = jsonrpc_request("tools/call", {
+    "name": "list_products",
+    "arguments": {}
+  }, request_id=10)
+  print(f"Response: {json.dumps(result, indent=2)}")
+
+  assert "result" in result, f"Expected result, got error: {result.get('error')}"
+  content = result["result"]["content"]
+  assert len(content) > 0, "Should have content"
+  
+  # Parse the products from the text content
+  products_text = content[0]["text"]
+  products_data = json.loads(products_text)
+  products = products_data.get("products", [])
+  
+  print(f"✓ Found {len(products)} products:")
+  for p in products:
+    print(f"  - {p['id']}: {p['title']} ({p['price_formatted']})")
+  
+  return products
+
+
 def test_create_checkout():
   """Test create_checkout MCP method."""
   print("\n=== Testing create_checkout ===")
@@ -180,6 +205,9 @@ def main():
   try:
     # Test discovery
     test_discovery()
+
+    # Test product catalog
+    test_list_products()
 
     # Test checkout flow
     checkout_id = test_create_checkout()

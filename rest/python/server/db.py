@@ -321,6 +321,12 @@ async def get_product(session: AsyncSession, product_id: str) -> Product | None:
   return await session.get(Product, product_id)
 
 
+async def get_all_products(session: AsyncSession) -> list[Product]:
+  """Retrieve all products."""
+  result = await session.execute(select(Product))
+  return list(result.scalars().all())
+
+
 async def get_inventory(session: AsyncSession, product_id: str) -> int | None:
   """Retrieve the inventory quantity for a product."""
   result = await session.execute(

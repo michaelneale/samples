@@ -44,6 +44,7 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 import models
 from pydantic import BaseModel
+import db
 from services.checkout_service import CheckoutService
 from ucp_sdk.models.schemas.shopping.order import PlatformConfig
 from ucp_sdk.models.schemas.shopping.payment_create_req import (
@@ -60,8 +61,43 @@ SERVER_VERSION = "0.1.0"
 # Tool definitions for tools/list
 TOOLS = [
   {
+    "name": "get_merchant_info",
+    "description": """Get merchant information and capabilities (UCP discovery).
+
+Returns:
+- UCP version and supported capabilities (checkout, fulfillment, discount, etc.)
+- Available payment handlers (google_pay, shop_pay, mock_payment_handler)
+- Service endpoints
+
+This is the MCP equivalent of fetching /.well-known/ucp""",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+    },
+  },
+  {
+    "name": "list_products",
+    "description": """List available products in the store catalog.
+
+Returns products with their IDs, titles, and prices. Use the product 'id' field
+when creating checkouts (in line_items.item.id).""",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+    },
+  },
+  {
     "name": "create_checkout",
-    "description": "Create a new checkout session",
+    "description": """Create a new checkout session for purchasing items.
+
+Returns a checkout object with:
+- id: Use this for subsequent update/complete calls
+- status: 'incomplete' (needs more info) or 'ready_for_complete' (ready for payment)
+- continue_url: URL where the user can complete payment in a secure UI
+- totals: Price breakdown
+
+IMPORTANT: When status is 'ready_for_complete', present the continue_url to the user 
+so they can complete payment securely. Do NOT attempt to collect payment details directly.""",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -102,7 +138,13 @@ TOOLS = [
   },
   {
     "name": "get_checkout",
-    "description": "Get the current state of a checkout session",
+    "description": """Get the current state of a checkout session.
+
+Check the 'status' field:
+- 'incomplete': More information needed (check 'messages' for what's missing)
+- 'ready_for_complete': Ready for payment - present continue_url to user
+- 'completed': Order placed successfully
+- 'canceled': Session was canceled""",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -113,7 +155,16 @@ TOOLS = [
   },
   {
     "name": "update_checkout",
-    "description": "Update a checkout session with new information",
+    "description": """Update a checkout session with buyer info, shipping, or discounts.
+
+Use this to:
+- Add/update buyer email and name
+- Set shipping address (in fulfillment.methods)
+- Apply discount codes (in discounts.codes)
+- Modify line items
+
+After updating, check if status becomes 'ready_for_complete'. If so, present 
+the continue_url to the user for secure payment completion.""",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -129,12 +180,18 @@ TOOLS = [
   },
   {
     "name": "complete_checkout",
-    "description": "Complete the checkout and place the order",
+    "description": """Complete the checkout and place the order. 
+
+WARNING: This requires payment credentials. In most cases, you should NOT call this 
+directly. Instead, present the continue_url to the user so they can complete payment 
+securely through the merchant's payment UI (Google Pay, credit card form, etc).
+
+Only use this if you have a pre-authorized payment token (e.g., from AP2 mandate).""",
     "inputSchema": {
       "type": "object",
       "properties": {
         "id": {"type": "string", "description": "Checkout session ID"},
-        "payment": {"type": "object", "description": "Payment instrument data"},
+        "payment": {"type": "object", "description": "Payment instrument with pre-authorized token"},
         "idempotency_key": {"type": "string", "description": "UUID for idempotency"},
       },
       "required": ["id", "idempotency_key"],
@@ -142,7 +199,7 @@ TOOLS = [
   },
   {
     "name": "cancel_checkout",
-    "description": "Cancel a checkout session",
+    "description": "Cancel a checkout session. Use if the user wants to abandon the purchase.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -224,8 +281,22 @@ def extract_platform_profile(params: dict[str, Any]) -> PlatformConfig | None:
   return None
 
 
+def get_ucp_discovery() -> dict[str, Any]:
+  """Get full UCP discovery profile."""
+  import pathlib
+  import re
+  profile_path = pathlib.Path(__file__).parent / "discovery_profile.json"
+  with profile_path.open() as f:
+    content = f.read()
+    content = re.sub(r'\{\{ENDPOINT\}\}', 'http://localhost:8182', content)
+    content = re.sub(r'\{\{SHOP_ID\}\}', 'test-shop-id', content)
+    return json.loads(content)
+
+
 def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
   """Handle MCP initialize method."""
+  discovery = get_ucp_discovery()
+  
   return {
     "protocolVersion": MCP_PROTOCOL_VERSION,
     "capabilities": {
@@ -234,6 +305,11 @@ def handle_initialize(params: dict[str, Any]) -> dict[str, Any]:
     "serverInfo": {
       "name": SERVER_NAME,
       "version": SERVER_VERSION,
+      "ucp": {
+        "version": discovery.get("ucp", {}).get("version"),
+        "capabilities": [c["name"] for c in discovery.get("ucp", {}).get("capabilities", [])],
+        "paymentHandlers": [h["id"] for h in discovery.get("payment", {}).get("handlers", [])],
+      },
     },
   }
 
@@ -248,15 +324,56 @@ def handle_tools_list() -> dict[str, Any]:
   return {"tools": TOOLS}
 
 
+def format_checkout_response(result: dict[str, Any]) -> list[dict[str, Any]]:
+  """Format checkout result with helpful instructions based on status."""
+  status = result.get("status")
+  continue_url = result.get("continue_url")
+  
+  content = [
+    {
+      "type": "text", 
+      "text": json.dumps(result, indent=2),
+    }
+  ]
+  
+  # Add clear instructions based on checkout status
+  if status == "ready_for_complete" and continue_url:
+    content.append({
+      "type": "text",
+      "text": f"\n✅ CHECKOUT READY FOR PAYMENT\n\nThe checkout is ready. Present this link to the user to complete payment securely:\n{continue_url}\n\nDo NOT attempt to collect payment details directly.",
+    })
+  elif status == "incomplete":
+    messages = result.get("messages", [])
+    if messages:
+      msg_text = "\n".join(f"- {m.get('content', m.get('message', str(m)))}" for m in messages)
+      content.append({
+        "type": "text",
+        "text": f"\n⚠️ CHECKOUT INCOMPLETE\n\nMissing information:\n{msg_text}\n\nUse update_checkout to provide the missing details.",
+      })
+  elif status == "completed":
+    order = result.get("order", {})
+    content.append({
+      "type": "text",
+      "text": f"\n🎉 ORDER PLACED\n\nOrder ID: {order.get('id')}\nOrder URL: {order.get('permalink_url')}",
+    })
+  
+  return content
+
+
 async def handle_tools_call(
   params: dict[str, Any],
   checkout_service: CheckoutService,
+  products_session,
 ) -> dict[str, Any]:
   """Handle tools/call method - routes to UCP checkout tools."""
   tool_name = params.get("name")
   arguments = params.get("arguments", {})
 
-  if tool_name == "create_checkout":
+  if tool_name == "get_merchant_info":
+    result = get_ucp_discovery()
+  elif tool_name == "list_products":
+    result = await handle_list_products(products_session)
+  elif tool_name == "create_checkout":
     result = await handle_create_checkout(arguments, checkout_service)
   elif tool_name == "get_checkout":
     result = await handle_get_checkout(arguments, checkout_service)
@@ -269,13 +386,14 @@ async def handle_tools_call(
   else:
     raise ValueError(f"Unknown tool: {tool_name}")
 
+  # Format response with helpful instructions for checkout-related tools
+  if tool_name in ("create_checkout", "get_checkout", "update_checkout", "complete_checkout"):
+    content = format_checkout_response(result)
+  else:
+    content = [{"type": "text", "text": json.dumps(result, indent=2)}]
+
   return {
-    "content": [
-      {
-        "type": "text",
-        "text": str(result),
-      }
-    ],
+    "content": content,
     "isError": False,
   }
 
@@ -283,6 +401,7 @@ async def handle_tools_call(
 async def process_mcp_request(
   body: dict[str, Any],
   checkout_service: CheckoutService,
+  products_session,
 ) -> dict[str, Any] | None:
   """Process a single MCP JSON-RPC request and return response dict.
   
@@ -313,7 +432,7 @@ async def process_mcp_request(
     elif method == "tools/list":
       result = handle_tools_list()
     elif method == "tools/call":
-      result = await handle_tools_call(params, checkout_service)
+      result = await handle_tools_call(params, checkout_service, products_session)
     # Direct UCP methods (for backwards compatibility / direct JSON-RPC calls)
     elif method == "create_checkout":
       result = await handle_create_checkout(params, checkout_service)
@@ -360,11 +479,33 @@ async def process_mcp_request(
     ).model_dump(exclude_none=True)
 
 
+async def handle_list_products(
+  products_session,
+) -> dict[str, Any]:
+  """Handle list_products MCP method."""
+  products = await db.get_all_products(products_session)
+  return {
+    "products": [
+      {
+        "id": p.id,
+        "title": p.title,
+        "price": p.price,
+        "price_formatted": f"${p.price / 100:.2f}",
+        "image_url": p.image_url,
+      }
+      for p in products
+    ]
+  }
+
+
 @router.post("/ucp/mcp")
 async def mcp_endpoint(
   request: Request,
   checkout_service: Annotated[
     CheckoutService, Depends(dependencies.get_checkout_service)
+  ],
+  products_session: Annotated[
+    Any, Depends(dependencies.get_products_db)
   ],
 ):
   """MCP JSON-RPC 2.0 endpoint for UCP Shopping Service.
@@ -388,7 +529,7 @@ async def mcp_endpoint(
     resp = make_error_response(PARSE_ERROR, "Parse error")
     return JSONResponse(content=resp.model_dump(exclude_none=True))
 
-  result = await process_mcp_request(body, checkout_service)
+  result = await process_mcp_request(body, checkout_service, products_session)
 
   # If result is None, it was a notification - return 202 Accepted
   if result is None:
@@ -403,6 +544,20 @@ async def mcp_endpoint(
     return JSONResponse(content=result)
 
 
+def get_default_payment_handlers() -> list[dict[str, Any]]:
+  """Get payment handlers from discovery profile."""
+  import pathlib
+  import re
+  profile_path = pathlib.Path(__file__).parent / "discovery_profile.json"
+  with profile_path.open() as f:
+    content = f.read()
+    # Replace template placeholders with valid JSON strings
+    content = re.sub(r'\{\{ENDPOINT\}\}', 'http://localhost:8182', content)
+    content = re.sub(r'\{\{SHOP_ID\}\}', 'test-shop-id', content)
+    profile = json.loads(content)
+  return profile.get("payment", {}).get("handlers", [])
+
+
 async def handle_create_checkout(
   params: dict[str, Any],
   checkout_service: CheckoutService,
@@ -415,6 +570,16 @@ async def handle_create_checkout(
 
   # Get or generate idempotency key
   idempotency_key = checkout_params.pop("idempotency_key", str(uuid.uuid4()))
+
+  # Provide default payment with handlers from discovery profile
+  if "payment" not in checkout_params:
+    checkout_params["payment"] = {
+      "instruments": [],
+      "handlers": get_default_payment_handlers(),
+    }
+  elif "handlers" not in checkout_params.get("payment", {}):
+    checkout_params["payment"]["handlers"] = get_default_payment_handlers()
+    checkout_params["payment"].setdefault("instruments", [])
 
   # Build checkout request
   checkout_req = models.UnifiedCheckoutCreateRequest(**checkout_params)
@@ -458,6 +623,16 @@ async def handle_update_checkout(
     checkout_params = {k: v for k, v in params.items() if k not in ("id", "_meta", "idempotency_key")}
 
   idempotency_key = params.get("idempotency_key", str(uuid.uuid4()))
+
+  # Provide default payment with handlers from discovery profile
+  if "payment" not in checkout_params:
+    checkout_params["payment"] = {
+      "instruments": [],
+      "handlers": get_default_payment_handlers(),
+    }
+  elif "handlers" not in checkout_params.get("payment", {}):
+    checkout_params["payment"]["handlers"] = get_default_payment_handlers()
+    checkout_params["payment"].setdefault("instruments", [])
 
   checkout_req = models.UnifiedCheckoutUpdateRequest(**checkout_params)
 
